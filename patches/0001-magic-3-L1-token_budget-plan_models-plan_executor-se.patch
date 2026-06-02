@@ -1,0 +1,900 @@
+From 1f7c6f0b25df32d821f9a76635a2e85a56991fa2 Mon Sep 17 00:00:00 2001
+From: "Hermes (local)" <cc@hermes-local>
+Date: Mon, 1 Jun 2026 20:19:44 +0800
+Subject: [PATCH 1/4] magic-3 L1: token_budget, plan_models, plan_executor,
+ session_state
+
+---
+ agent/plan_executor.py | 369 +++++++++++++++++++++++++++++++++++++++++
+ agent/plan_models.py   | 118 +++++++++++++
+ agent/session_state.py | 234 ++++++++++++++++++++++++++
+ agent/token_budget.py  | 135 +++++++++++++++
+ 4 files changed, 856 insertions(+)
+ create mode 100644 agent/plan_executor.py
+ create mode 100644 agent/plan_models.py
+ create mode 100644 agent/session_state.py
+ create mode 100644 agent/token_budget.py
+
+diff --git a/agent/plan_executor.py b/agent/plan_executor.py
+new file mode 100644
+index 000000000..a3204bfb9
+--- /dev/null
++++ b/agent/plan_executor.py
+@@ -0,0 +1,369 @@
++"""
++Plan executor — lifecycle management for plan recovery + fork isolation.
++
++Layout under ~/.hermes/plans/<slug>/:
++  ├── manifest.json   — PlanManifest (metadata + lifecycle)
++  ├── plan.md          — the plan content (agent writes)
++  ├── state.json       — PlanExecutionState (runtime tracking)
++  └── .lock            — file lock for concurrent access
++
++Fork isolation: plan execution creates an INDEPENDENT child session.
++The parent session that created the plan is left untouched. The fork
++session gets its own session_id, messages, and tool state. The only
++link is through manifest.resume_from_session ↔ manifest.resume_to_session.
++
++Safety rules:
++  - Max 3 resumes per plan (prevent infinite loops)
++  - Only DRAFT or PAUSED plans can be resumed
++  - Only one session can execute a plan at a time (EXECUTING state)
++  - File lock prevents concurrent manifest writes
++"""
++
++from __future__ import annotations
++
++import fcntl
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Optional
++
++from .plan_models import (
++    PlanManifest,
++    PlanExecutionState,
++    PlanResumeContext,
++    PlanState,
++    ForkMode,
++    StepState,
++)
++
++logger = logging.getLogger(__name__)
++
++# ── Constants ────────────────────────────────────────────────────────
++
++PLANS_DIR_NAME = "plans"
++MAX_RESUME_COUNT = 3
++
++# Minimal plan template injected when the agent needs to write a plan
++PLAN_TEMPLATE = """## Plan: {title}
++
++### Goal
++[What this plan aims to accomplish]
++
++### Context
++[Background information, constraints, relevant session history]
++
++### Steps
++1. [First step]
++2. [Second step]
++3. [Third step]
++
++### Notes
++[Additional notes, pitfalls, edge cases]
++"""
++
++
++# ── Helper ───────────────────────────────────────────────────────────
++
++
++def _get_plans_dir(hermes_home: str | Path) -> Path:
++    """Get or create the plans directory."""
++    p = Path(hermes_home) / PLANS_DIR_NAME
++    p.mkdir(parents=True, exist_ok=True)
++    return p
++
++
++def _next_slug(plans_dir: Path, base_slug: str) -> str:
++    """Resolve a slug, appending '-N' if a plan with that slug exists."""
++    candidate = base_slug
++    n = 1
++    while (plans_dir / candidate).exists():
++        candidate = f"{base_slug}-{n}"
++        n += 1
++    return candidate
++
++
++# ── PlanExecutor ─────────────────────────────────────────────────────
++
++
++class PlanExecutor:
++    """Manages plan lifecycle: create, resume, fork, complete, fail."""
++
++    def __init__(self, hermes_home: str | Path):
++        self._plans_dir = _get_plans_dir(hermes_home)
++
++    # ── Create ────────────────────────────────────────────────────
++
++    def create(
++        self,
++        slug: str,
++        title: str,
++        content: Optional[str] = None,
++        resume_from_session: Optional[str] = None,
++    ) -> PlanManifest:
++        """Create a new plan directory with manifest and plan.md."""
++        final_slug = _next_slug(self._plans_dir, slug)
++        plan_dir = self._plans_dir / final_slug
++        plan_dir.mkdir(parents=True, exist_ok=False)
++
++        manifest = PlanManifest(
++            slug=final_slug,
++            title=title,
++            resume_from_session=resume_from_session,
++        )
++
++        # Write plan.md
++        plan_content = content or PLAN_TEMPLATE.format(title=title)
++        (plan_dir / "plan.md").write_text(plan_content, encoding="utf-8")
++
++        # Write manifest
++        (plan_dir / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
++
++        # Write empty execution state
++        exec_state = PlanExecutionState()
++        (plan_dir / "state.json").write_text(exec_state.to_json(), encoding="utf-8")
++
++        logger.info("Created plan '%s' at %s", final_slug, plan_dir)
++        return manifest
++
++    # ── Resume ────────────────────────────────────────────────────
++
++    def resume(self, slug: str, session_id: str) -> Optional[PlanResumeContext]:
++        """Resume a plan, returning a context for injection into the agent.
++
++        Returns None if the plan cannot be resumed (missing, wrong state, etc.).
++        """
++        plan_dir = self._plans_dir / slug
++        if not plan_dir.is_dir():
++            logger.error("Plan '%s' not found at %s", slug, plan_dir)
++            return None
++
++        manifest = self._load_manifest(plan_dir)
++        if manifest is None:
++            return None
++
++        # Guard: only DRAFT or PAUSED can be resumed
++        if manifest.state not in (PlanState.DRAFT, PlanState.PAUSED):
++            logger.error("Plan '%s' is %s — cannot resume", slug, manifest.state.value)
++            return None
++
++        exec_state = self._load_exec_state(plan_dir)
++        if exec_state is None:
++            exec_state = PlanExecutionState()
++
++        # Guard: max resume count
++        if exec_state.resume_count >= MAX_RESUME_COUNT:
++            logger.error("Plan '%s' has been resumed %d times — max %d",
++                         slug, exec_state.resume_count, MAX_RESUME_COUNT)
++            return None
++
++        # Read plan content
++        plan_content = (plan_dir / manifest.plan_file).read_text(encoding="utf-8")
++
++        # Capture fork mode BEFORE mutating state to EXECUTING
++        fork_mode = ForkMode.RESUME if manifest.state == PlanState.PAUSED else ForkMode.FRESH
++
++        # Mark as executing
++        manifest.state = PlanState.EXECUTING
++        manifest.resume_to_session = session_id
++        manifest.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++        exec_state.resume_count += 1
++        exec_state.session_id = session_id
++
++        with _lock_plan_dir(plan_dir):
++            (plan_dir / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
++            (plan_dir / "state.json").write_text(exec_state.to_json(), encoding="utf-8")
++
++        logger.info("Resumed plan '%s' → session %s (resume #%d)",
++                     slug, session_id, exec_state.resume_count)
++
++        return PlanResumeContext(
++            manifest=manifest,
++            exec_state=exec_state,
++            plan_content=plan_content,
++            plan_dir=str(plan_dir),
++            fork_mode=fork_mode,
++        )
++
++    # ── Lifecycle ─────────────────────────────────────────────────
++
++    def mark_complete(self, slug: str) -> bool:
++        """Mark a plan as completed."""
++        return self._transition(slug, PlanState.COMPLETED)
++
++    def mark_failed(self, slug: str, error: str = "") -> bool:
++        """Mark a plan as failed with an error message."""
++        plan_dir = self._plans_dir / slug
++        if not plan_dir.is_dir():
++            return False
++
++        manifest = self._load_manifest(plan_dir)
++        exec_state = self._load_exec_state(plan_dir)
++        if manifest is None:
++            return False
++
++        manifest.state = PlanState.FAILED
++        manifest.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++
++        if exec_state:
++            exec_state.error = error
++
++        with _lock_plan_dir(plan_dir):
++            (plan_dir / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
++            if exec_state:
++                (plan_dir / "state.json").write_text(exec_state.to_json(), encoding="utf-8")
++
++        logger.info("Plan '%s' marked FAILED: %s", slug, error)
++        return True
++
++    def update_step(self, slug: str, step_index: int, status: str, error: str = "") -> bool:
++        """Update the execution state of a single step."""
++        plan_dir = self._plans_dir / slug
++        exec_state = self._load_exec_state(plan_dir)
++        if exec_state is None:
++            return False
++
++        if step_index >= len(exec_state.steps):
++            return False
++
++        exec_state.steps[step_index].status = status
++        exec_state.steps[step_index].error = error
++        exec_state.current_step = step_index
++
++        with _lock_plan_dir(plan_dir):
++            (plan_dir / "state.json").write_text(exec_state.to_json(), encoding="utf-8")
++
++        return True
++
++    # ── Query ─────────────────────────────────────────────────────
++
++    def list_plans(self, state: Optional[PlanState] = None) -> list[PlanManifest]:
++        """List all plans, optionally filtered by state."""
++        plans = []
++        for plan_dir in sorted(self._plans_dir.iterdir()):
++            if not plan_dir.is_dir():
++                continue
++            m = self._load_manifest(plan_dir)
++            if m is None:
++                continue
++            if state is not None and m.state != state:
++                continue
++            plans.append(m)
++        return plans
++
++    def get_plan(self, slug: str) -> Optional[PlanManifest]:
++        """Get a single plan by slug."""
++        plan_dir = self._plans_dir / slug
++        return self._load_manifest(plan_dir)
++
++    def get_content(self, slug: str) -> Optional[str]:
++        """Read the plan.md content."""
++        plan_dir = self._plans_dir / slug
++        manifest = self._load_manifest(plan_dir)
++        if manifest is None:
++            return None
++        plan_file = plan_dir / manifest.plan_file
++        if plan_file.exists():
++            return plan_file.read_text(encoding="utf-8")
++        return None
++
++    # ── Helpers ───────────────────────────────────────────────────
++
++    def _load_manifest(self, plan_dir: Path) -> Optional[PlanManifest]:
++        mf = plan_dir / "manifest.json"
++        if not mf.exists():
++            return None
++        try:
++            return PlanManifest.from_json(mf.read_text(encoding="utf-8"))
++        except Exception:
++            logger.exception("Failed to load manifest from %s", mf)
++            return None
++
++    def _load_exec_state(self, plan_dir: Path) -> Optional[PlanExecutionState]:
++        sf = plan_dir / "state.json"
++        if not sf.exists():
++            return None
++        try:
++            return PlanExecutionState.from_json(sf.read_text(encoding="utf-8"))
++        except Exception:
++            logger.exception("Failed to load state from %s", sf)
++            return None
++
++    def _transition(self, slug: str, new_state: PlanState) -> bool:
++        """Atomically transition a plan to a new state."""
++        plan_dir = self._plans_dir / slug
++        if not plan_dir.is_dir():
++            return False
++        manifest = self._load_manifest(plan_dir)
++        if manifest is None:
++            return False
++        manifest.state = new_state
++        manifest.updated_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++        with _lock_plan_dir(plan_dir):
++            (plan_dir / "manifest.json").write_text(manifest.to_json(), encoding="utf-8")
++        logger.info("Plan '%s' → %s", slug, new_state.value)
++        return True
++
++
++# ── File locking ─────────────────────────────────────────────────────
++
++
++import contextlib
++
++
++@contextlib.contextmanager
++def _lock_plan_dir(plan_dir: Path):
++    """Exclusive file lock on a plan directory for safe concurrent writes."""
++    lockfile = plan_dir / ".lock"
++    fd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX)
++        yield
++    finally:
++        fcntl.flock(fd, fcntl.LOCK_UN)
++        os.close(fd)
++
++
++# ── Plan prompt injection ─────────────────────────────────────────────
++
++
++def build_plan_prompt(context: PlanResumeContext) -> str:
++    """Build a system prompt injection for plan execution/resume.
++
++    Injected into the agent's system prompt when executing a plan.
++    """
++    lines = []
++
++    if context.fork_mode == ForkMode.RESUME:
++        lines.append("## RESUMING PLAN EXECUTION")
++        lines.append(f"You are resuming plan '{context.manifest.slug}': {context.manifest.title}")
++        if context.exec_state.error:
++            lines.append(f"Previous error: {context.exec_state.error}")
++    else:
++        lines.append("## PLAN EXECUTION MODE")
++        lines.append(f"You are executing plan '{context.manifest.slug}': {context.manifest.title}")
++        lines.append("Follow the plan below. Mark steps as done as you complete them.")
++        lines.append("If you hit a blocker, save progress and report the error.")
++
++    if context.exec_state.steps:
++        lines.append(f"\n### Current Progress (step {context.exec_state.current_step + 1}/{context.exec_state.total_steps})")
++        for step in context.exec_state.steps:
++            icon = {
++                "done": "✅",
++                "in_progress": "🔄",
++                "failed": "❌",
++                "skipped": "⏭️",
++                "pending": "⬜",
++            }.get(step.status, "⬜")
++            lines.append(f"  {icon} Step {step.index + 1}: {step.content}")
++
++    lines.append(f"\n### The Plan")
++    lines.append(context.plan_content)
++
++    lines.append("\n### Instructions")
++    lines.append("1. Work through the plan steps in order.")
++    lines.append("2. After completing each step, note it in your response.")
++    lines.append("3. If you cannot complete the plan, explain why and preserve partial progress.")
++    lines.append("4. When all steps are done, state 'PLAN COMPLETE'.")
++
++    return "\n".join(lines)
+diff --git a/agent/plan_models.py b/agent/plan_models.py
+new file mode 100644
+index 000000000..65f8a6736
+--- /dev/null
++++ b/agent/plan_models.py
+@@ -0,0 +1,118 @@
++"""
++Plan recovery source + fork isolation — data models.
++
++Design constraints (from Claude Code plan system):
++  - Plans are named directories under ~/.hermes/plans/<slug>/
++  - manifest.json: metadata + lifecycle state
++  - plan.md: the plan content (markdown, agent writes it)
++  - state.json: runtime execution state (current step, sub-task states)
++  - .lock: file lock for concurrent access
++
++Slug rules: lowercase, kebab-case, max 64 chars. Auto-increment on conflict.
++Fork semantics: a plan execution creates an INDEPENDENT child session with its
++  own session_id. The manifest links back to the session that created the plan
++  and forward to the session that executed it.
++"""
++
++from __future__ import annotations
++
++import enum
++import json
++import os
++import time
++from dataclasses import dataclass, field, asdict
++from pathlib import Path
++from typing import Optional
++
++
++# ── Enums ────────────────────────────────────────────────────────────
++
++
++class PlanState(str, enum.Enum):
++    """Plan lifecycle states."""
++    DRAFT = "draft"           # plan.md exists, not yet executed
++    EXECUTING = "executing"   # a session is currently executing this plan
++    COMPLETED = "completed"   # execution finished successfully
++    FAILED = "failed"         # execution failed
++    PAUSED = "paused"         # paused mid-execution, awaiting resume
++
++
++class ForkMode(str, enum.Enum):
++    """How a plan session relates to its parent."""
++    FRESH = "fresh"           # brand new session for plan execution
++    RESUME = "resume"         # resuming a previously paused plan session
++
++
++# ── Data classes ─────────────────────────────────────────────────────
++
++
++@dataclass
++class StepState:
++    """Runtime state of a single plan step."""
++    index: int
++    content: str              # the step line from plan.md
++    status: str = "pending"   # pending | in_progress | done | skipped | failed
++    error: Optional[str] = None
++
++
++@dataclass
++class PlanManifest:
++    """On-disk manifest for a plan directory."""
++    slug: str
++    title: str
++    created_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
++    updated_at: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
++    state: PlanState = PlanState.DRAFT
++
++    # Session linkage (bidirectional)
++    resume_from_session: Optional[str] = None   # session that wrote this plan
++    resume_to_session: Optional[str] = None     # session that executed this plan
++
++    # Metadata
++    plan_file: str = "plan.md"
++    version: int = 1
++    tags: list[str] = field(default_factory=list)
++
++    def to_json(self) -> str:
++        d = asdict(self)
++        d["state"] = self.state.value
++        return json.dumps(d, indent=2, ensure_ascii=False)
++
++    @classmethod
++    def from_json(cls, s: str) -> "PlanManifest":
++        d = json.loads(s)
++        d["state"] = PlanState(d["state"])
++        return cls(**d)
++
++
++@dataclass
++class PlanExecutionState:
++    """Runtime execution state (state.json in plan directory)."""
++    current_step: int = 0
++    total_steps: int = 0
++    steps: list[StepState] = field(default_factory=list)
++    paused_at_step: Optional[int] = None
++    error: Optional[str] = None
++    session_id: Optional[str] = None  # the fork session executing this plan
++    resume_count: int = 0              # prevent infinite resume loops
++
++    def to_json(self) -> str:
++        d = asdict(self)
++        d["steps"] = [asdict(s) for s in self.steps]
++        return json.dumps(d, indent=2, ensure_ascii=False)
++
++    @classmethod
++    def from_json(cls, s: str) -> "PlanExecutionState":
++        d = json.loads(s)
++        d["steps"] = [StepState(**st) for st in d.get("steps", [])]
++        return cls(**d)
++
++
++@dataclass
++class PlanResumeContext:
++    """Injected into agent at runtime when resuming a plan."""
++    manifest: PlanManifest
++    exec_state: PlanExecutionState
++    plan_content: str
++    plan_dir: str          # absolute path to .hermes/plans/<slug>/
++    fork_mode: ForkMode = ForkMode.FRESH
+diff --git a/agent/session_state.py b/agent/session_state.py
+new file mode 100644
+index 000000000..8332c257e
+--- /dev/null
++++ b/agent/session_state.py
+@@ -0,0 +1,234 @@
++"""
++Session state tracker for AIAgent lifecycle.
++
++Design: thin wrapper around existing flags. Adds:
++  - State enumeration (for child agent introspection via parent)
++  - Transition enforcement (for P2-1 plan fork safety)
++  - Status snapshot queryable from parent (improves multi-agent coordination)
++
++Not a full FSM replacement of existing flags — the flags still drive the
++main loop; this layer provides a single source of truth for external query.
++"""
++
++from __future__ import annotations
++
++import enum
++import threading
++from typing import Optional
++
++
++class AgentState(enum.Enum):
++    """AIAgent lifecycle states."""
++
++    IDLE = "idle"              # Initialized but not yet running
++    RUNNING = "running"        # Actively processing in main loop
++    WAITING_TOOLS = "waiting_tools"  # Tool calls executing
++    COMPRESSING = "compressing"      # Context compression in progress
++    WAITING_USER = "waiting_user"    # Clarify callback pending
++    INTERRUPTED = "interrupted"      # User aborted
++    ERROR = "error"            # Unrecoverable error
++    DONE = "done"              # Completed successfully
++
++    @property
++    def is_terminal(self) -> bool:
++        """Terminal states — no further processing possible."""
++        return self in (AgentState.INTERRUPTED, AgentState.DONE, AgentState.ERROR)
++
++    @property
++    def is_active(self) -> bool:
++        """Agent is in a state where it could still produce output."""
++        return not self.is_terminal
++
++
++class AgentStatus:
++    """Snapshot of agent state queryable by parent agents.
++
++    Used for multi-agent coordination: parent checks child state before
++    forking plans, sending interrupts, or waiting for results.
++    """
++
++    __slots__ = (
++        "state",
++        "session_id",
++        "iteration_count",
++        "children_active",
++        "error_message",
++        "abort_reason",
++        "done_reason",
++    )
++
++    def __init__(
++        self,
++        state: AgentState,
++        session_id: str = "",
++        iteration_count: int = 0,
++        children_active: int = 0,
++        error_message: str = "",
++        abort_reason: str = "",
++        done_reason: str = "",
++    ):
++        self.state = state
++        self.session_id = session_id
++        self.iteration_count = iteration_count
++        self.children_active = children_active
++        self.error_message = error_message
++        self.abort_reason = abort_reason
++        self.done_reason = done_reason
++
++    def to_dict(self) -> dict:
++        return {
++            "state": self.state.value,
++            "session_id": self.session_id,
++            "iteration_count": self.iteration_count,
++            "children_active": self.children_active,
++            "error_message": self.error_message,
++            "abort_reason": self.abort_reason,
++            "done_reason": self.done_reason,
++        }
++
++    def __repr__(self) -> str:
++        return (
++            f"AgentStatus(state={self.state.value}, session={self.session_id}, "
++            f"iter={self.iteration_count}, children={self.children_active})"
++        )
++
++
++class SessionState:
++    """Lightweight state tracker for AIAgent.
++
++    Wraps existing flags (_interrupt_requested, _executing_tools, etc.)
++    and provides a single query point for parent agents. The main loop
++    continues to drive from the flags — this is a read-only layer for
++    coordination, not a driver replacement.
++
++    Integration points:
++      - agent_init.py: creates agent._session_state
++      - conversation_loop.py: updates state at lifecycle transitions
++            (start_run → RUNNING, tool batch → WAITING_TOOLS, etc.)
++      - delegate_tool.py: parent queries child.state for coordination
++      - run_agent.py: session.resume → reads last known state
++    """
++
++    __slots__ = (
++        "_agent_ref",   # Weak ref to owner agent (weakref.ref)
++        "_state",
++        "_lock",
++        "_error_message",
++        "_abort_reason",
++        "_done_reason",
++        "_session_id",
++        "_iteration_count",
++    )
++
++    def __init__(self, agent):
++        # Store a strong reference — we need to read state flags from agent.
++        # SessionState lifespan matches agent lifespan.
++        self._agent_ref = agent
++        self._state = AgentState.IDLE
++        self._lock = threading.RLock()
++        self._error_message = ""
++        self._abort_reason = ""
++        self._done_reason = ""
++        self._session_id = ""
++        self._iteration_count = 0
++
++    # ── State getter/setter ──────────────────────────────────────────
++
++    @property
++    def state(self) -> AgentState:
++        with self._lock:
++            return self._state
++
++    @state.setter
++    def state(self, new_state: AgentState):
++        with self._lock:
++            old = self._state
++            if old == new_state:
++                return
++            # Validate transition (non-strict: allow reset)
++            if old.is_terminal and not new_state.is_terminal:
++                # Terminal → non-terminal is allowed for agent reuse
++                # (e.g. gateway reuses agent objects across messages)
++                pass
++            self._state = new_state
++
++    # ── Convenience setters for main-loop integration ─────────────────
++
++    def set_running(self):
++        """Called at top of run_conversation() main loop entry."""
++        self.state = AgentState.RUNNING
++        self._iteration_count = 0
++
++    def set_waiting_tools(self):
++        """Called when tool batch starts executing."""
++        self.state = AgentState.WAITING_TOOLS
++
++    def set_compressing(self):
++        """Called when compression begins."""
++        self.state = AgentState.COMPRESSING
++
++    def set_waiting_user(self):
++        """Called when clarify callback is pending."""
++        self.state = AgentState.WAITING_USER
++
++    def set_interrupted(self, reason: str = ""):
++        """Called when user aborts the agent."""
++        self.state = AgentState.INTERRUPTED
++        self._abort_reason = reason or self._abort_reason
++
++    def set_error(self, message: str = "", reason: str = ""):
++        """Called on unrecoverable error."""
++        self.state = AgentState.ERROR
++        self._error_message = message or self._error_message
++        self._abort_reason = reason or self._abort_reason
++
++    def set_done(self, reason: str = ""):
++        """Called when agent completes normally."""
++        self.state = AgentState.DONE
++        self._done_reason = reason or self._done_reason
++
++    def bump_iteration(self):
++        """Increment iteration counter (call at top of each turn)."""
++        with self._lock:
++            self._iteration_count += 1
++
++    def set_session_id(self, sid: str):
++        self._session_id = sid
++
++    # ── Derived properties (read from agent flags) ───────────────────
++
++    @property
++    def is_terminal(self) -> bool:
++        return self._state.is_terminal
++
++    @property
++    def is_interrupted(self) -> bool:
++        return self._state == AgentState.INTERRUPTED
++
++    @property
++    def is_running(self) -> bool:
++        return self._state == AgentState.RUNNING
++
++    @property
++    def is_idle(self) -> bool:
++        return self._state == AgentState.IDLE
++
++    # ── Snapshot for parent query ─────────────────────────────────────
++
++    def snapshot(self) -> AgentStatus:
++        """Return a copy of current state safe for parent thread reading."""
++        agent = self._agent_ref
++        with self._lock:
++            children = len(getattr(agent, "_active_children", ()))
++            return AgentStatus(
++                state=self._state,
++                session_id=self._session_id,
++                iteration_count=self._iteration_count,
++                children_active=children,
++                error_message=self._error_message,
++                abort_reason=self._abort_reason,
++                done_reason=self._done_reason,
++            )
++
++    def __repr__(self) -> str:
++        return f"SessionState({self._state.value}, iter={self._iteration_count})"
+diff --git a/agent/token_budget.py b/agent/token_budget.py
+new file mode 100644
+index 000000000..d196f03cf
+--- /dev/null
++++ b/agent/token_budget.py
+@@ -0,0 +1,135 @@
++"""Token-aware budget management with auto-continuation.
++
++Parses natural-language budget directives from user messages
++(e.g. ``+500k``, ``use 2M tokens``) and auto-continues the
++conversation loop until the budget is exhausted or output
++diminishes below a threshold.
++
++Inspired by Claude Code's tokenBudget.ts / query/tokenBudget.ts.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from dataclasses import dataclass
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++# ── Budget parsing ──────────────────────────────────────────────────
++
++# Match +N at line start or end, with k/m/b suffix.  Uses \\b
++# (word boundary) instead of end-of-line anchor so directives like
++# "+500k do this" still parse when they appear inline.
++_SHORTHAND_RE = re.compile(
++    r"(?:^|\n)\s*\+(\d+(?:\.\d+)?)\s*([kmb])\b",
++    re.IGNORECASE,
++)
++# Match verbose: "use N tokens", "预算 N token", etc.
++_VERBOSE_RE = re.compile(
++    r"(?:use|spend|预算|消耗|分配)\s+(\d+(?:\.\d+)?)\s*([kmb万]?)\s*(?:token|tokens|个?token|万)?",
++    re.IGNORECASE,
++)
++
++_SUFFIX_MULTIPLIER = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000, "万": 10_000, "": 1}
++
++
++def parse_token_budget(text: str) -> Optional[int]:
++    """Extract a token budget directive from a user message.
++
++    Returns the budget in raw token count, or None if no directive found.
++    Supports: ``+500k``, ``+2m``, ``use 1M tokens``, ``预算 100k token``.
++    """
++    if not text:
++        return None
++
++    # Try shorthand first (more common, stricter pattern)
++    m = _SHORTHAND_RE.search(text)
++    if m:
++        value = float(m.group(1))
++        suffix = m.group(2).lower()
++        return int(value * _SUFFIX_MULTIPLIER.get(suffix, 1))
++
++    # Try verbose
++    m = _VERBOSE_RE.search(text)
++    if m:
++        value = float(m.group(1))
++        suffix = (m.group(2) or "").lower()
++        return int(value * _SUFFIX_MULTIPLIER.get(suffix, 1))
++
++    return None
++
++
++def remove_budget_directive(text: str) -> str:
++    """Strip the budget directive from a user message so it doesn't
++    appear as part of the task to the model."""
++    text = _SHORTHAND_RE.sub("", text).strip()
++    text = _VERBOSE_RE.sub("", text).strip()
++    return text
++
++
++# ── Budget tracker ──────────────────────────────────────────────────
++
++# Thresholds (matching Claude's constants)
++COMPLETION_THRESHOLD = 0.90   # stop at 90% of budget
++DIMINISH_DELTA = 500          # tokens — below this for 2 consecutive turns → stop
++DIMINISH_TURNS = 2            # consecutive low-delta turns before stopping
++MIN_CONTINUATIONS_BEFORE_DIMINISH = 3  # don't check diminish until 3+ continuations
++
++
++@dataclass
++class BudgetTracker:
++    """Per-conversation token budget state."""
++
++    budget: int                    # total token budget
++    used: int = 0                  # output tokens consumed so far
++    continuation_count: int = 0    # number of auto-continuations
++    last_turn_delta: int = 0       # tokens produced in the last turn
++    consecutive_low_delta: int = 0 # turns in a row with delta < threshold
++
++    def record_turn(self, turn_tokens: int) -> None:
++        """Record output tokens from a completed turn."""
++        self.used += turn_tokens
++        self.last_turn_delta = turn_tokens
++        self.continuation_count += 1
++
++    def should_continue(self) -> bool:
++        """Return True if the agent should auto-continue."""
++        if self.budget <= 0:
++            return False
++
++        pct = self.used / self.budget
++
++        # Below 90% → continue
++        if pct < COMPLETION_THRESHOLD:
++            # Check diminishing returns
++            if self.continuation_count >= MIN_CONTINUATIONS_BEFORE_DIMINISH:
++                if self.last_turn_delta < DIMINISH_DELTA:
++                    self.consecutive_low_delta += 1
++                else:
++                    self.consecutive_low_delta = 0
++
++                if self.consecutive_low_delta >= DIMINISH_TURNS:
++                    return False
++            return True
++
++        return False
++
++    def get_nudge(self) -> str:
++        """Build the auto-continuation nudge message."""
++        pct = int(self.used / self.budget * 100)
++        remaining = self.budget - self.used
++        return (
++            f"Stopped at {pct}% of token budget "
++            f"({self.used:,} / {self.budget:,} used, "
++            f"{remaining:,} remaining). "
++            "Keep working — do not summarize or stop early."
++        )
++
++    def get_completion_message(self) -> str:
++        """Build the budget-exhausted message."""
++        return (
++            f"Token budget reached: {self.used:,} / {self.budget:,} "
++            f"({int(self.used / self.budget * 100)}%)."
++        )
+-- 
+2.43.0
+

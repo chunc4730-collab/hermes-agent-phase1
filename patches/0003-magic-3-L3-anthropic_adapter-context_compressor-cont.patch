@@ -1,0 +1,633 @@
+From b9101b6944beaaf7ca1102aeebe5194ea0bc14f9 Mon Sep 17 00:00:00 2001
+From: "Hermes (local)" <cc@hermes-local>
+Date: Mon, 1 Jun 2026 20:20:38 +0800
+Subject: [PATCH 3/4] magic-3 L3: anthropic_adapter, context_compressor,
+ context_engine, conversation_compression, auxiliary_client
+
+---
+ agent/anthropic_adapter.py        |  38 +----
+ agent/auxiliary_client.py         |  71 +++-------
+ agent/context_compressor.py       | 227 ++++++++++++++++++++++--------
+ agent/context_engine.py           |   9 --
+ agent/conversation_compression.py |  52 +++----
+ 5 files changed, 207 insertions(+), 190 deletions(-)
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index a4a211843..d9bbe2d8e 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -1783,25 +1783,11 @@ def _strip_orphaned_tool_blocks(result: List[Dict[str, Any]]) -> None:
+                     tool_result_ids.add(block.get("tool_use_id"))
+     for m in result:
+         if m["role"] == "assistant" and isinstance(m["content"], list):
+-            kept = [
++            m["content"] = [
+                 b
+                 for b in m["content"]
+                 if b.get("type") != "tool_use" or b.get("id") in tool_result_ids
+             ]
+-            # If stripping an orphaned tool_use mutated a turn that also carries a
+-            # signed thinking block, that block's Anthropic signature was computed
+-            # against the ORIGINAL (un-stripped) turn content and is now invalid.
+-            # Anthropic rejects the replayed turn with HTTP 400 "thinking blocks in
+-            # the latest assistant message cannot be modified".  Flag the turn so
+-            # _manage_thinking_signatures can demote the dead signature instead of
+-            # replaying it verbatim.  See hermes-agent: extended-thinking + parallel
+-            # tool batch interrupted mid-flight → non-retryable 400 crash-loop.
+-            if len(kept) != len(m["content"]) and any(
+-                isinstance(b, dict) and b.get("type") in {"thinking", "redacted_thinking"}
+-                for b in m["content"]
+-            ):
+-                m["_thinking_signature_invalidated"] = True
+-            m["content"] = kept
+             if not m["content"]:
+                 m["content"] = [{"type": "text", "text": "(tool call removed)"}]
+ 
+@@ -1846,10 +1832,6 @@ def _merge_consecutive_roles(result: List[Dict[str, Any]]) -> List[Dict[str, Any
+                     fixed[-1]["content"] = prev_content + curr_content
+             else:
+                 # Consecutive assistant messages — merge text content.
+-                # Propagate the orphan-strip signature-invalidation flag onto the
+-                # surviving (prev) dict so _manage_thinking_signatures still sees it.
+-                if m.get("_thinking_signature_invalidated"):
+-                    fixed[-1]["_thinking_signature_invalidated"] = True
+                 # Drop thinking blocks from the *second* message: their
+                 # signature was computed against a different turn boundary
+                 # and becomes invalid once merged.
+@@ -1938,26 +1920,11 @@ def _manage_thinking_signatures(
+         else:
+             # Latest assistant on direct Anthropic: keep signed, downgrade unsigned
+             # to text so the reasoning isn't lost.
+-            #
+-            # Exception: if orphan-stripping (or another structural mutation) removed
+-            # a tool_use block from THIS turn, every thinking signature on it was
+-            # computed against the original turn content and is now dead.  Anthropic
+-            # rejects the turn either way — replaying the signed block 400s with
+-            # "thinking blocks in the latest assistant message cannot be modified",
+-            # and a bare signed block with no following tool_use is also invalid.
+-            # Demote ALL thinking blocks on this turn to text so the turn replays
+-            # cleanly and the model can re-plan from the surviving tool results.
+-            signature_dead = bool(m.get("_thinking_signature_invalidated"))
+             new_content = []
+             for b in m["content"]:
+                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
+                     new_content.append(b)
+                     continue
+-                if signature_dead:
+-                    thinking_text = b.get("thinking", "")
+-                    if thinking_text:
+-                        new_content.append({"type": "text", "text": thinking_text})
+-                    continue
+                 if b.get("type") == "redacted_thinking":
+                     # Redacted blocks use 'data' for the signature payload —
+                     # drop the block when 'data' is missing (can't be validated).
+@@ -1977,9 +1944,6 @@ def _manage_thinking_signatures(
+             if isinstance(b, dict) and b.get("type") in _THINKING_TYPES:
+                 b.pop("cache_control", None)
+ 
+-        # Drop the internal bookkeeping flag — it must never reach the API payload.
+-        m.pop("_thinking_signature_invalidated", None)
+-
+ 
+ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
+     """Keep only the most recent ``_MAX_KEEP_IMAGES`` computer-use screenshots.
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index 4c8877232..44b11dfaa 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -1680,48 +1680,26 @@ def _read_main_provider() -> str:
+ # per turn — no lock needed. Cleared by ``clear_runtime_main()``.
+ _RUNTIME_MAIN_PROVIDER: str = ""
+ _RUNTIME_MAIN_MODEL: str = ""
+-_RUNTIME_MAIN_BASE_URL: str = ""
+-_RUNTIME_MAIN_API_KEY: str = ""
+-_RUNTIME_MAIN_API_MODE: str = ""
+ 
+ 
+-def set_runtime_main(
+-    provider: str,
+-    model: str,
+-    *,
+-    base_url: str = "",
+-    api_key: str = "",
+-    api_mode: str = "",
+-) -> None:
+-    """Record the live runtime provider/model/credentials for the current AIAgent.
++def set_runtime_main(provider: str, model: str) -> None:
++    """Record the live runtime provider/model for the current AIAgent.
+ 
+     Called by ``run_agent.AIAgent._sync_runtime_main_for_aux_routing`` (or
+     equivalent setter) at the top of each turn so that
+     ``_read_main_provider`` / ``_read_main_model`` reflect CLI/gateway
+     overrides instead of the stale config.yaml default.
+-
+-    For ``custom:`` providers, ``base_url`` and ``api_key`` must also be
+-    recorded so that ``_resolve_auto`` can construct a valid client in
+-    Step 1 instead of falling through to the aggregator chain.
+     """
+     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
+     _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
+     _RUNTIME_MAIN_MODEL = (model or "").strip()
+-    _RUNTIME_MAIN_BASE_URL = (base_url or "").strip()
+-    _RUNTIME_MAIN_API_KEY = api_key.strip() if isinstance(api_key, str) else ""
+-    _RUNTIME_MAIN_API_MODE = (api_mode or "").strip()
+ 
+ 
+ def clear_runtime_main() -> None:
+     """Clear the runtime override (e.g. on session end)."""
+     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
+     _RUNTIME_MAIN_PROVIDER = ""
+     _RUNTIME_MAIN_MODEL = ""
+-    _RUNTIME_MAIN_BASE_URL = ""
+-    _RUNTIME_MAIN_API_KEY = ""
+-    _RUNTIME_MAIN_API_MODE = ""
+ 
+ 
+ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+@@ -3002,18 +2980,6 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
+     runtime_api_key = runtime.get("api_key", "")
+     runtime_api_mode = str(runtime.get("api_mode") or "")
+ 
+-    # Fall back to process-local globals when main_runtime dict was not
+-    # provided or was incomplete.  ``set_runtime_main()`` now records
+-    # base_url/api_key/api_mode alongside provider/model, so custom:
+-    # providers get the full credential surface in Step 1 of the
+-    # auto-detect chain.
+-    if not runtime_base_url and _RUNTIME_MAIN_BASE_URL:
+-        runtime_base_url = _RUNTIME_MAIN_BASE_URL
+-    if not runtime_api_key and _RUNTIME_MAIN_API_KEY:
+-        runtime_api_key = _RUNTIME_MAIN_API_KEY
+-    if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
+-        runtime_api_mode = _RUNTIME_MAIN_API_MODE
+-
+     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
+     #    provider (not 'custom').  This catches the common "env poisoning"
+     #    scenario where a user switches providers via `hermes model` but the
+@@ -4759,23 +4725,24 @@ def _build_call_kwargs(
+         kwargs["temperature"] = temperature
+ 
+     if max_tokens is not None:
+-        # We do NOT cap output by default. Most chat-completions providers treat
+-        # an omitted max_tokens as "use the model's max output", which is what we
+-        # want for auxiliary tasks (compression summaries, titles, vision, etc.) —
+-        # an explicit cap only risks truncating a summary or 400-ing on providers
+-        # that reject the parameter outright (e.g. GitHub Copilot / newer OpenAI
+-        # GPT-5 models require max_completion_tokens, not max_tokens; ZAI vision
+-        # models reject it entirely with error 1210). Omitting it sidesteps all of
+-        # those wire-format quirks at once.
+-        #
+-        # The one exception is the Anthropic Messages wire (MiniMax and any
+-        # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
+-        # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
+-        # there.
+-        _effective_base = base_url or (
+-            _current_custom_base_url() if provider == "custom" else ""
++        # Codex adapter handles max_tokens internally; OpenRouter/Nous use max_tokens.
++        # Direct OpenAI api.openai.com with newer models needs max_completion_tokens.
++        # ZAI vision models (glm-4v-flash, glm-4v-plus, etc.) reject max_tokens with
++        # error code 1210 ("API 调用参数有误") on multimodal requests — skip it.
++        _model_lower = (model or "").lower()
++        _skip_max_tokens = (
++            provider == "zai"
++            and ("4v" in _model_lower or "5v" in _model_lower or "-v" in _model_lower)
+         )
+-        if _is_anthropic_compat_endpoint(provider, _effective_base):
++        if _skip_max_tokens:
++            pass  # ZAI vision models do not accept max_tokens
++        elif provider == "custom":
++            custom_base = base_url or _current_custom_base_url()
++            if base_url_hostname(custom_base) == "api.openai.com":
++                kwargs["max_completion_tokens"] = max_tokens
++            else:
++                kwargs["max_tokens"] = max_tokens
++        else:
+             kwargs["max_tokens"] = max_tokens
+ 
+     if tools:
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 079c4b0b5..4c66539f3 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -61,7 +61,7 @@ SUMMARY_PREFIX = (
+ )
+ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+ 
+-# Handoff prefixes that shipped in earlier releases. A summary persisted under
++# Handoff prefixes that shipped in earlier releases. A summary persists under
+ # one of these can be inherited into a resumed lineage (#35344); when it is
+ # re-normalized on re-compaction we must strip the OLD prefix too, otherwise the
+ # stale directive it carried (e.g. "resume exactly from Active Task") survives
+@@ -548,10 +548,6 @@ class ContextCompressor(ContextEngine):
+         self._last_compression_savings_pct = 100.0
+         self._ineffective_compression_count = 0
+         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
+-        self.last_real_prompt_tokens = 0
+-        self.last_compression_rough_tokens = 0
+-        self.last_rough_tokens_when_real_prompt_fit = 0
+-        self.awaiting_real_usage_after_compression = False
+ 
+     def update_model(
+         self,
+@@ -649,10 +645,6 @@ class ContextCompressor(ContextEngine):
+ 
+         self.last_prompt_tokens = 0
+         self.last_completion_tokens = 0
+-        self.last_real_prompt_tokens = 0
+-        self.last_compression_rough_tokens = 0
+-        self.last_rough_tokens_when_real_prompt_fit = 0
+-        self.awaiting_real_usage_after_compression = False
+ 
+         self.summary_model = summary_model_override or ""
+ 
+@@ -686,44 +678,6 @@ class ContextCompressor(ContextEngine):
+         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+         self.last_completion_tokens = usage.get("completion_tokens", 0)
+         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
+-        if self.last_prompt_tokens > 0:
+-            self.last_real_prompt_tokens = self.last_prompt_tokens
+-            if self.last_prompt_tokens < self.threshold_tokens:
+-                if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
+-                    self.last_rough_tokens_when_real_prompt_fit = self.last_compression_rough_tokens
+-            else:
+-                self.last_rough_tokens_when_real_prompt_fit = 0
+-        self.awaiting_real_usage_after_compression = False
+-
+-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+-        """Return True when a high rough preflight estimate is known-noisy.
+-
+-        ``estimate_request_tokens_rough(..., tools=...)`` intentionally
+-        overestimates schema-heavy requests so Hermes compresses before a
+-        provider rejects the payload. After a successful compressed API call,
+-        though, provider ``prompt_tokens`` are a better signal than repeating
+-        compaction from the same rough schema overhead. Defer only while the
+-        rough estimate has grown modestly since a request the provider proved
+-        fit under the threshold.
+-        """
+-        if rough_tokens < self.threshold_tokens:
+-            return False
+-        if self.last_real_prompt_tokens <= 0:
+-            return False
+-        if self.last_real_prompt_tokens >= self.threshold_tokens:
+-            return False
+-
+-        baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
+-        if baseline <= 0:
+-            return False
+-
+-        growth = max(0, rough_tokens - baseline)
+-        tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))
+-        if growth > tolerated_growth:
+-            return False
+-
+-        self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
+-        return True
+ 
+     def should_compress(self, prompt_tokens: int = None) -> bool:
+         """Check if context exceeds the compression threshold.
+@@ -1516,16 +1470,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+ 
+     @staticmethod
+     def _strip_summary_prefix(summary: str) -> str:
+-        """Return summary body without the current, legacy, or any historical
+-        handoff prefix.
+-
+-        Historical prefixes must be stripped too: a handoff persisted under an
+-        older prefix can be inherited into a resumed lineage (#35344), and if we
+-        only re-prepend the current prefix without removing the old one, the
+-        stale directive it carried stays embedded in the body.
++        """Return summary body without the current, legacy, or historical handoff prefix.
++        Historical prefixes can persist in inherited summaries that survive
++        multiple re-compactions, so we must strip them too; otherwise the stale
++        directives they embed (e.g. "resume exactly") keep hijacking replies.
+         """
+         text = (summary or "").strip()
+-        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
++        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX) + _HISTORICAL_SUMMARY_PREFIXES:
+             if text.startswith(prefix):
+                 return text[len(prefix):].lstrip()
+         return text
+@@ -1539,9 +1490,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+     @staticmethod
+     def _is_context_summary_content(content: Any) -> bool:
+         text = _content_text_for_contains(content).lstrip()
+-        if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
+-            return True
+-        return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
++        return (
++            text.startswith(SUMMARY_PREFIX)
++            or text.startswith(LEGACY_SUMMARY_PREFIX)
++            or any(text.startswith(prefix) for prefix in _HISTORICAL_SUMMARY_PREFIXES)
++        )
+ 
+     @classmethod
+     def _find_latest_context_summary(
+@@ -1824,7 +1777,32 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+     # Main compression entry point
+     # ------------------------------------------------------------------
+ 
+-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
++    def microcompact(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++        """Lightweight, no-LLM pruning of old tool results.
++
++        Claude Code's microcompact runs BEFORE API calls to keep the
++        prompt lean without paying for a full compaction.  This wraps
++        ``_prune_old_tool_results`` with conservative tail protection
++        (keep ~15 most recent tool results intact) and never calls an
++        LLM.  Safe to call at high frequency.
++
++        Returns the (possibly shortened) message list.
++        """
++        if not messages or len(messages) < 20:
++            return messages
++        try:
++            pruned, count = self._prune_old_tool_results(
++                messages, protect_tail_count=15)
++            if count and not self.quiet_mode:
++                logger.info(
++                    "Microcompact: pruned %d old tool result(s) "
++                    "(no LLM call)", count)
++            return pruned
++        except Exception:
++            logger.warning("Microcompact failed", exc_info=True)
++            return messages  # non-destructive on failure
++
++    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False, session_memory: str = None) -> List[Dict[str, Any]]:
+         """Compress conversation messages by summarizing middle turns.
+ 
+         Algorithm:
+@@ -1932,8 +1910,33 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+                 tail_msgs,
+             )
+ 
+-        # Phase 3: Generate structured summary
+-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
++        summary: Optional[str] = None
++
++        # Phase 2.5: Session Memory Compact — use existing extracted memory
++        # as a zero-cost summary instead of calling the LLM.  Only fires on
++        # first compression (no prior iterative summary) to avoid degrading
++        # the quality of iterative updates.  Falls through silently to Phase 3
++        # if memory is unavailable, empty, or a prior summary already exists.
++        if session_memory and not summary_body and not self._previous_summary:
++            mem_text = session_memory.strip()
++            if mem_text:
++                summary = (
++                    f"{SUMMARY_PREFIX}\n"
++                    f"The following is a structured summary of earlier "
++                    f"conversation turns, extracted from session memory:\n\n"
++                    f"{mem_text}"
++                )
++                if not self.quiet_mode:
++                    logger.info(
++                        "Session Memory Compact: using %d-char memory snapshot "
++                        "instead of LLM summarization — saved auxiliary model cost",
++                        len(mem_text),
++                    )
++
++        # Phase 3: Generate structured summary (skipped if SM compact
++        # already produced one)
++        if not summary:
++            summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+ 
+         # If summary generation failed, behavior splits on
+         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
+@@ -2076,3 +2079,105 @@ The user has requested that this compaction PRIORITISE preserving all informatio
+             logger.info("Compression #%d complete", self.compression_count)
+ 
+         return compressed
++
++    # ── Recursive recovery: collapse + bare summary ──────────────────
++    # When normal compression (L1) is exhausted, these provide deeper
++    # fallback tiers before giving up entirely.  Claude Code uses a
++    # similar cascade: compress → collapse → bare summary.
++
++    def collapse(
++        self, messages: List[Dict[str, Any]],
++        system_message: Optional[Dict[str, Any]] = None,
++    ) -> List[Dict[str, Any]]:
++        """L2: Aggressive compression — keep only first 3 exchanges + last 8 messages.
++
++        Much more aggressive than ``compress()``: drops all middle turns instead
++        of summarizing them, then runs a lightweight prune pass to avoid sending
++        the full stripped middle section.  Still preserves the system prompt,
++        the very first exchange (task-defining), and the most recent context.
++
++        Returns the collapsed message list (no API call needed).
++        """
++        if not messages or len(messages) <= 15:
++            return messages
++
++        # Identify head messages: system prompt + first meaningful exchange
++        head = []
++        idx = 0
++        if messages and messages[0].get("role") == "system":
++            head.append(messages[0])
++            idx = 1
++        # Capture first ~3 non-system exchanges (up to 6 messages)
++        head_count = 0
++        while idx < len(messages) and head_count < 3:
++            head.append(messages[idx])
++            idx += 1
++            head_count += 1
++
++        # Tail: last 8 messages (or fewer if short)
++        tail_start = max(idx, len(messages) - 8)
++        tail = messages[tail_start:]
++
++        # Build collapsed list with a clear insertion marker
++        collapse_note = {
++            "role": "user",
++            "content": (
++                "[Context collapsed: intermediate turns removed to fit context window. "
++                f"{len(messages) - len(head) - len(tail)} messages were dropped. "
++                "Continue from the most recent context below.]"
++            ),
++        }
++        collapsed = head + [collapse_note] + tail
++
++        # Run a final prune pass on the collapsed list so any stale tool
++        # results in the tail get replaced with compact summaries.
++        collapsed, _ = self._prune_old_tool_results(
++            collapsed,
++            protect_tail_count=min(8, len(tail)),
++            protect_tail_tokens=self.tail_token_budget,
++        )
++        return collapsed
++
++    def bare_summary(
++        self, messages: List[Dict[str, Any]],
++    ) -> List[Dict[str, Any]]:
++        """L3: Last resort — replace all history with a single summary message.
++
++        Only the system prompt and a single user message remain.  The
++        summary is constructed from the most recent assistant message
++        (if any) or a generic fallback.  This is a desperate measure
++        for when even collapse is still too large.
++
++        Returns a 2-message list: [system, summary_user].
++        """
++        system = messages[0] if messages and messages[0].get("role") == "system" else None
++
++        # Try to extract the last meaningful assistant content
++        last_content = ""
++        for msg in reversed(messages):
++            if msg.get("role") == "assistant" and msg.get("content"):
++                content = msg["content"]
++                if isinstance(content, str) and len(content.strip()) > 20:
++                    last_content = content.strip()[:1500]
++                    break
++
++        summary = (
++            "[History collapsed due to context limits. Here is the last "
++            "meaningful assistant response for continuity:\n\n"
++            f"{last_content}\n\n"
++            "---\n"
++            "The conversation history has been fully stripped. Please "
++            "continue the task based on what you can infer from this summary "
++            "and the system prompt above.]"
++            if last_content else
++            "[History collapsed due to context limits. The conversation "
++            "history has been fully stripped. Please continue the task "
++            "based on the system prompt above. You may need to ask the "
++            "user to re-state their current goal.]"
++        )
++
++        result = []
++        if system:
++            result.append(system)
++        result.append({"role": "user", "content": summary})
++        return result
+diff --git a/agent/context_engine.py b/agent/context_engine.py
+index 79c31fb48..bb426fc18 100644
+--- a/agent/context_engine.py
++++ b/agent/context_engine.py
+@@ -115,15 +115,6 @@ class ContextEngine(ABC):
+         """
+         return False
+ 
+-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+-        """Return True when preflight should trust recent real usage instead.
+-
+-        Built-in compression uses this to avoid re-compacting from known-noisy
+-        rough estimates after a compressed request has already fit. Third-party
+-        engines can ignore it safely.
+-        """
+-        return False
+-
+     # -- Optional: manual /compress preflight ------------------------------
+ 
+     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index a0b077e3e..94e204183 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -429,8 +429,20 @@ def compress_context(
+         except Exception:
+             pass
+ 
++    # Session Memory Compact: extract memory snapshot for zero-cost
++    # compression (Phase 2.5 in ContextCompressor).  Falls through to
++    # LLM summarization if memory is unavailable or a prior summary exists.
++    session_memory = None
++    if agent._memory_store:
++        try:
++            mem_content = agent._memory_store.format_for_system_prompt("memory")
++            if mem_content and mem_content.strip():
++                session_memory = mem_content.strip()
++        except Exception:
++            pass
++
+     try:
+-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
++        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force, session_memory=session_memory)
+     except TypeError:
+         # Plugin context engine with strict signature that doesn't accept
+         # focus_topic / force — fall back to calling without them.
+@@ -575,18 +587,19 @@ def compress_context(
+             force=True,
+         )
+ 
+-    # Keep the post-compression rough estimate for diagnostics, but do not
+-    # treat it as provider-reported prompt usage. Schema-heavy rough estimates
+-    # can remain above threshold even after the next real API request fits.
++    # Update token estimate after compaction so pressure calculations
++    # use the post-compression count, not the stale pre-compression one.
++    # Use estimate_request_tokens_rough() so tool schemas are included —
++    # with 50+ tools enabled, schemas alone can add 20-30K tokens, and
++    # omitting them delays the next compression cycle far past the
++    # configured threshold (issue #14695).
+     _compressed_est = estimate_request_tokens_rough(
+         compressed,
+         system_prompt=new_system_prompt or "",
+         tools=agent.tools or None,
+     )
+-    agent.context_compressor.last_compression_rough_tokens = _compressed_est
+-    agent.context_compressor.last_prompt_tokens = -1
++    agent.context_compressor.last_prompt_tokens = _compressed_est
+     agent.context_compressor.last_completion_tokens = 0
+-    agent.context_compressor.awaiting_real_usage_after_compression = True
+ 
+     # Clear the file-read dedup cache.  After compression the original
+     # read content is summarised away — if the model re-reads the same
+@@ -598,7 +611,7 @@ def compress_context(
+         pass
+ 
+     logger.info(
+-        "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
++        "context compression done: session=%s messages=%d->%d tokens=~%s",
+         agent.session_id or "none", _pre_msg_count, len(compressed),
+         f"{_compressed_est:,}",
+     )
+@@ -644,12 +657,6 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
+     # after a confirmed provider rejection, so the alternative is failure.
+     target_bytes = 4 * 1024 * 1024
+     changed_count = 0
+-    # Track parts that are over the target but could NOT be shrunk under it.
+-    # If any survive, retrying is pointless — the same oversized payload will
+-    # be re-sent and rejected again, wasting the single retry budget.  We only
+-    # report success (caller retries) when every over-threshold image was
+-    # actually brought under the target.
+-    unshrinkable_oversized = 0
+ 
+     def _shrink_data_url(url: str) -> Optional[str]:
+         """Return a smaller data URL, or None if shrink can't help."""
+@@ -716,34 +723,17 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
+                 if resized:
+                     image_value["url"] = resized
+                     changed_count += 1
+-                elif isinstance(url, str) and url.startswith("data:") \
+-                        and len(url) > target_bytes:
+-                    unshrinkable_oversized += 1
+             elif isinstance(image_value, str):
+                 resized = _shrink_data_url(image_value)
+                 if resized:
+                     part["image_url"] = resized
+                     changed_count += 1
+-                elif image_value.startswith("data:") \
+-                        and len(image_value) > target_bytes:
+-                    unshrinkable_oversized += 1
+ 
+     if changed_count:
+         logger.info(
+             "image-shrink recovery: re-encoded %d image part(s) to fit under %.0f MB",
+             changed_count, target_bytes / (1024 * 1024),
+         )
+-    if unshrinkable_oversized:
+-        # At least one oversized image could not be shrunk under the target.
+-        # Retrying would re-send it and fail identically, so signal "no
+-        # progress" even if other parts shrank — the caller will surface the
+-        # original error rather than burning its single retry on a no-op.
+-        logger.warning(
+-            "image-shrink recovery: %d oversized image part(s) could not be "
+-            "shrunk under %.0f MB — not retrying (would re-send rejected payload)",
+-            unshrinkable_oversized, target_bytes / (1024 * 1024),
+-        )
+-        return False
+     return changed_count > 0
+ 
+ 
+-- 
+2.43.0
+
