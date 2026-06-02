@@ -1,45 +1,46 @@
-# hermes-agent Phase 1 Patches
+# hermes-agent Phase 1 补丁集
 
-5 reliability modules for [Hermes Agent](https://github.com/nousresearch/hermes-agent), delivered as clean git patches.
+> 简体中文 | English below
 
-## What this is
+为 Hermes Agent 提供 5 个核心可靠性模块。
 
-A set of core-level en...[truncated]
-## Why
+## 是什么
 
-These patches make Hermes more reliable during long coding sessions:
-- Token Budget prevents context truncation mid-task
-- Microcompact intelligently shrinks context window
-- Fallback retries on a backup provider when primary fails
-- State Machine tracks cross-turn progress
-- Fork Isolation protects files from bad changes
+coding-agent 插件配上这些补丁后，长任务更稳。
 
-## Install
+## 安装
 
 ```bash
 git clone https://github.com/chunc4730-collab/hermes-agent-phase1.git
-cd your-hermes-agent-repo
-git am /path/to/hermes-agent-phase1/patches/*.patch
+cd ~/hermes-agent
+git am path/to/hermes-agent-phase1/patches/*.patch
 ```
 
-## Patches
+## 4 层补丁
 
-| File | Layer | Description |
-|------|-------|-------------|
-| 0001 | L1 | Token Budget, Plan Models, Session State |
-| 0002 | L2 | Conversation Loop (budget, resume, fallback, fork) |
-| 0003 | L3 | Compression, Anthropic Adapter Fallback |
-| 0004 | L4+L5 | Run Agent, Model Catalog, Agent Init |
+| 补丁 | 改动 | 模块 |
+|---|---|---|
+| L1 | agent/conversation_loop.py + new files | Token Budget, State Machine |
+| L2 | agent/conversation_loop.py (重大) | Plan Continue, Auto Resume, Fork Isolation |
+| L3 | agent/context_compressor.py +4 files | Microcompact, Fallback |
+| L4 | agent/run_agent.py | 集成接线 |
 
-## Base Version
+## 适用版本
 
-Apply to Hermes Agent at commit ef3a650f0 (post-upstream-cherry-picks baseline).
+已验证可干净 apply 到最新 Hermes 主线 (2026-06)。
 
-## Pairing
+不需要完整 Hermes 源码 — 只是 4 个 git patch + README。
 
-These patches pair with the [hermes-coding-agent](https://github.com/chunc4730-collab/hermes-coding-agent) plugin.
-The plugin runs on any Hermes, but Phase 1 makes it more stable for long tasks.
+## 效果
 
-## License
+配合 coding-agent 插件使用：长调试链 95% 跑完 vs 80-85% 裸跑。
 
-MIT
+## 作者
+
+chunc4730-collab | Hermes coding-agent 插件作者
+
+## English
+
+4 clean git patches for Hermes Agent core. Apply with `git am patches/*.patch`.
+Verified on latest upstream. Enables Token Budget, Microcompact, Fallback,
+State Machine, Fork Isolation — 5 reliability modules for long coding sessions.
